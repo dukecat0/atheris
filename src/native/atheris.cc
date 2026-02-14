@@ -97,6 +97,9 @@ NO_SANITIZE
 void prefuzz_trace_regex_match(std::string pattern_match, py::handle object) {}
 
 NO_SANITIZE
+void prefuzz_trace_literal(py::handle literal) {}
+
+NO_SANITIZE
 std::vector<std::string> Setup(
     const std::vector<std::string>& args,
     const std::function<void(py::bytes data)>& test_one_input,
@@ -267,6 +270,7 @@ void Fuzz() {
   atheris.attr("Mutate") = core.attr("Mutate");
   atheris.attr("_trace_cmp") = core.attr("_trace_cmp");
   atheris.attr("_trace_regex_match") = core.attr("_trace_regex_match");
+  atheris.attr("_trace_literal") = core.attr("_trace_literal");
   atheris.attr("_trace_branch") = core.attr("_trace_branch");
   atheris.attr("_reserve_counter") = core.attr("_reserve_counter");
   atheris.attr("hook_str_module") = core.attr("hook_str_module");
@@ -284,6 +288,7 @@ PYBIND11_MODULE(native, m) {
   m.def("_trace_cmp", &prefuzz_trace_cmp, py::return_value_policy::move);
   m.def("_reserve_counter", &ReservePendingCounter);
   m.def("_trace_regex_match", &prefuzz_trace_regex_match);
+  m.def("_trace_literal", &prefuzz_trace_literal);
   m.def("libfuzzer_is_loaded", &libfuzzer_is_loaded);
 #if PY_MAJOR_VERSION >= 3 && PY_MINOR_VERSION >= 11
   // Implementations for 3.11+'s new code table data structures.

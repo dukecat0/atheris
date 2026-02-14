@@ -375,11 +375,24 @@ void unhook_str_module() {
 
 NO_SANITIZE
 int TestOneInput(const uint8_t* data, size_t size) {
+  static bool emitted_literals = false;
   static bool dummy = OnFirstTestOneInput();
   (void)dummy;
   RefreshTimeout();
 
   UpdateCounterArrays();
+
+  if (!emitted_literals) {
+    PyObject* modules = py::module::import("sys").attr("modules").ptr();
+    PyObject* atheris_obj = PyDict_GetItemString(modules, "atheris");
+    if (atheris_obj != nullptr) {
+      py::object atheris_mod = py::reinterpret_borrow<py::object>(atheris_obj);
+      if (py::hasattr(atheris_mod, "_emit_registered_literals")) {
+        atheris_mod.attr("_emit_registered_literals")();
+      }
+    }
+    emitted_literals = true;
+  }
 
   try {
     test_one_input_global(py::bytes(reinterpret_cast<const char*>(data), size));
@@ -489,6 +502,7 @@ PYBIND11_MODULE(ATHERIS_MODULE_NAME, m) {
   m.def("_reserve_counters", ReserveCounters);
   m.def("_trace_cmp", &_trace_cmp, py::return_value_policy::move);
   m.def("_trace_regex_match", &TraceRegexMatch);
+  m.def("_trace_literal", &TraceLiteral);
   m.def("hook_str_module", &hook_str_module);
   m.def("unhook_str_module", &unhook_str_module);
   // Exposed for testing.

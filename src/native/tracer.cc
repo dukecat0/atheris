@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <string_view>
@@ -165,6 +166,38 @@ void TraceRegexMatch(const std::string generated_match, py::handle re_obj) {
   // We specify -1 as the last argument to let the mutator know that these bytes
   // need to be emitted. This basically means that the `memcmp` is different.
   __sanitizer_weak_hook_memcmp((char*)fake_pc, generated, generated, size, -1);
+}
+
+namespace {
+
+NO_SANITIZE
+void TraceLiteralBytes(std::string_view literal) {
+  if (literal.empty()) {
+    return;
+  }
+  size_t fake_pc = std::hash<std::string_view>{}(literal);
+  __sanitizer_weak_hook_memcmp(reinterpret_cast<void*>(fake_pc),
+                               literal.data(), literal.data(), literal.size(),
+                               -1);
+}
+
+}  // namespace
+
+NO_SANITIZE
+void TraceLiteral(py::handle literal) {
+  if (PyBytes_Check(literal.ptr())) {
+    std::string_view bytes_view(
+        PyBytes_AS_STRING(literal.ptr()), PyBytes_GET_SIZE(literal.ptr()));
+    TraceLiteralBytes(bytes_view);
+    return;
+  }
+  if (PyUnicode_Check(literal.ptr())) {
+    py::bytes utf8 = UnicodeToUtf8(literal);
+    std::string_view bytes_view(PyBytes_AS_STRING(utf8.ptr()),
+                                PyBytes_GET_SIZE(utf8.ptr()));
+    TraceLiteralBytes(bytes_view);
+    return;
+  }
 }
 
 // This function hooks COMPARE_OP, inserts calls for dataflow tracing

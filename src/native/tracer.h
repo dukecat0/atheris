@@ -31,6 +31,9 @@ PyObject* TraceCompareOp(void* pc, PyObject* left, PyObject* right, int opid,
 // emitted by the fuzzer. `re_obj` is the compiled regex object.
 void TraceRegexMatch(std::string generated_match, pybind11::handle re_obj);
 
+// Passes literal bytes or unicode to the backend fuzzer for dictionary use.
+void TraceLiteral(pybind11::handle literal);
+
 // Record a StartsWith or EndsWith call as a string comparison.
 void TraceWith(PyObject* self, PyObject* prefix, int64_t start, int64_t end,
                bool is_endswith /* false is startswith */);

@@ -71,6 +71,9 @@ py::handle _trace_cmp(py::handle left, py::handle right, int opid, uint64_t idx,
 NO_SANITIZE
 void _trace_regex_match(std::string pattern_match, py::handle object) {}
 
+NO_SANITIZE
+void _trace_literal(py::handle literal) {}
+
 
 int global_counter = 0;
 
@@ -164,6 +167,7 @@ PYBIND11_MODULE(native, m) {
   m.def("_trace_cmp", &_trace_cmp, py::return_value_policy::move);
   m.def("_reserve_counter", &_reserve_counter);
   m.def("_trace_regex_match", &_trace_regex_match);
+  m.def("_trace_literal", &_trace_literal);
 #if PY_MAJOR_VERSION >= 3 && PY_MINOR_VERSION >= 11
   m.def("_generate_codetable", &GenerateCodetable);
   m.def("_generate_exceptiontable", &GenerateExceptiontable);

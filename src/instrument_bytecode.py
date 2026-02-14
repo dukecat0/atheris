@@ -24,6 +24,7 @@ import sys
 import types
 from typing import Any, Callable, List, Set, TypeVar, Union
 
+from . import string_literals
 from . import utils
 from .version_dependent import args_terminator_after_callable
 from .version_dependent import args_terminator_before_callable
@@ -937,6 +938,8 @@ def patch_code(
     # This avoids comparison between str and bytes (BytesWarning).
     if isinstance(const, str) and const == "__ATHERIS_INSTRUMENTED__":
       return code
+
+  string_literals.register_from_code(code)
 
   inst = Instrumentor(code)
 
