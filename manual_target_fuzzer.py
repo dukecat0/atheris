@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -27,50 +28,6 @@ except ImportError:  # pragma: no cover
 # It contains many embedded string/bytes literals and gated branches that are
 # unlikely to be reached with purely random mutations.
 
-HTTP_METHODS = (
-    "GET",
-    "POST",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "OPTIONS",
-)
-
-HEADER_NAMES = (
-    "Content-Type",
-    "User-Agent",
-    "X-Api-Key",
-    "X-Exploit",
-    "X-Mode",
-    "X-Debug",
-)
-
-CONTENT_TYPES = (
-    "application/json",
-    "application/x-www-form-urlencoded",
-    "text/plain",
-)
-
-# Bytes magic that tends to be useful for real-world parsers.
-MAGIC_BYTES = (
-    b"\x89PNG\r\n\x1a\n",
-    b"GIF87a",
-    b"GIF89a",
-    b"PK\x03\x04",  # zip
-)
-
-SQL_KEYWORDS = (
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "UNION",
-    "DROP",
-)
-
 
 def _parse_headers(text: str) -> dict[str, str]:
   headers: dict[str, str] = {}
@@ -86,13 +43,59 @@ def _parse_headers(text: str) -> dict[str, str]:
 
 
 def _interesting_branching_logic(data: bytes) -> None:
+  # Keep these literals inside the instrumented function so they appear in the
+  # function's constants (co_consts) and can be auto-registered/emitted.
+  http_methods = (
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "OPTIONS",
+  )
+
+  header_names = (
+    "Content-Type",
+    "User-Agent",
+    "X-Api-Key",
+    "X-Exploit",
+    "X-Mode",
+    "X-Debug",
+  )
+
+  content_types = (
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "text/plain",
+  )
+
+  # Bytes magic that tends to be useful for real-world parsers.
+  magic_bytes = (
+    b"\x89PNG\r\n\x1a\n",
+    b"GIF87a",
+    b"GIF89a",
+    b"PK\x03\x04",  # zip
+  )
+
+  sql_keywords = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "FROM",
+    "WHERE",
+    "JOIN",
+    "UNION",
+    "DROP",
+  )
+
   # Help Atheris by ensuring this code gets instrumented.
   # (instrument_func will patch code objects and register literals.)
   text = data.decode("utf-8", "ignore")
 
   # Gate 1: looks like an HTTP request.
   first_line = text.split("\n", 1)[0]
-  if not any(first_line.startswith(m + " ") for m in HTTP_METHODS):
+  if not any(first_line.startswith(m + " ") for m in http_methods):
     return
 
   # Gate 2: requires a plausible path and query.
@@ -114,7 +117,7 @@ def _interesting_branching_logic(data: bytes) -> None:
   headers = _parse_headers(head)
 
   # Gate 4: require some known header names.
-  if not any(h in headers for h in HEADER_NAMES):
+  if not any(h in headers for h in header_names):
     return
 
   mode = headers.get("X-Mode", "")
@@ -137,11 +140,11 @@ def _interesting_branching_logic(data: bytes) -> None:
     return
 
   # Gate 6: magic bytes condition.
-  if not any(m in data for m in MAGIC_BYTES):
+  if not any(m in data for m in magic_bytes):
     return
 
   content_type = headers.get("Content-Type", "")
-  if content_type not in CONTENT_TYPES:
+  if content_type not in content_types:
     return
 
   # Body parsing: JSON, form, or plain.
@@ -194,7 +197,7 @@ def _interesting_branching_logic(data: bytes) -> None:
 
     # Gate via SQL-ish keywords.
     stmt = (form.get("q") or [""])[0]
-    if not any(k in stmt.upper() for k in SQL_KEYWORDS):
+    if not any(k in stmt.upper() for k in sql_keywords):
       return
 
     if headers.get("X-Debug") == "1" and "DROP" in stmt.upper():
@@ -213,6 +216,19 @@ def TestOneInput(data: bytes) -> None:
 def main() -> None:
   # Ensure our own target code is instrumented (and thus literals registered).
   atheris.instrument_func(_interesting_branching_logic)
+
+  # Optional debug: show how many literals were registered (only available on
+  # modified Atheris that exposes get_string_literals()).
+  if (
+      "ATHERIS_LITERALS_DEBUG" in os.environ
+      and hasattr(atheris, "get_string_literals")
+  ):
+    try:
+      lits = atheris.get_string_literals()
+      print(f"[DEBUG] registered literals: {len(lits)}", file=sys.stderr)
+    except Exception:
+      pass
+
   atheris.Setup(sys.argv, TestOneInput)
   atheris.Fuzz()
 
