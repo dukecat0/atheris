@@ -1,16 +1,20 @@
+"""Fuzz target: a simple config-file parser.
+
+This is a realistic target that mimics how real-world applications parse
+structured text configuration.  It naturally contains many string/bytes
+literals in comparisons (section names, directive keywords, option values)
+that are hard to discover through random mutation alone but become easily
+reachable when the fuzzer has a dictionary of those literals.
+"""
+
 from __future__ import annotations
 
-import base64
-import json
 import os
-import re
 import sys
-import urllib.parse
 
 try:
   import atheris
 except ImportError:  # pragma: no cover
-  # Allow running directly from a source checkout without installing.
   import importlib.util
   import pathlib
 
@@ -24,201 +28,305 @@ except ImportError:  # pragma: no cover
   spec.loader.exec_module(atheris)
 
 
-# A manual target designed to benefit from literal/dictionary guidance.
-# It contains many embedded string/bytes literals and gated branches that are
-# unlikely to be reached with purely random mutations.
+# ---------------------------------------------------------------------------
+# A small but realistic config-file parser.
+#
+# Supports:
+#   [section]           -- section headers
+#   key = value         -- key-value pairs
+#   @include <path>     -- directives
+#   @define NAME VALUE  -- macro definitions
+#   # comment           -- line comments
+#
+# Sections recognised: database, server, auth, logging, cache, features
+# Each section has its own set of known keys and valid values.
+# Several real bugs are embedded behind natural parsing logic.
+# ---------------------------------------------------------------------------
 
 
-def _parse_headers(text: str) -> dict[str, str]:
-  headers: dict[str, str] = {}
-  for line in text.split("\n"):
-    if ":" not in line:
-      continue
-    name, value = line.split(":", 1)
-    name = name.strip()
-    value = value.strip()
-    if name:
-      headers[name] = value
-  return headers
+class ConfigError(Exception):
+  """Raised on invalid configuration."""
 
 
-def _interesting_branching_logic(data: bytes) -> None:
-  # Keep these literals inside the instrumented function so they appear in the
-  # function's constants (co_consts) and can be auto-registered/emitted.
-  http_methods = (
-    "GET",
-    "POST",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "OPTIONS",
-  )
+class Config:
+  """Parsed configuration container."""
 
-  header_names = (
-    "Content-Type",
-    "User-Agent",
-    "X-Api-Key",
-    "X-Exploit",
-    "X-Mode",
-    "X-Debug",
-  )
+  def __init__(self):
+    self.sections: dict[str, dict[str, str]] = {}
+    self.macros: dict[str, str] = {}
+    self.includes: list[str] = []
+    self._current_section: str | None = None
 
-  content_types = (
-    "application/json",
-    "application/x-www-form-urlencoded",
-    "text/plain",
-  )
 
-  # Bytes magic that tends to be useful for real-world parsers.
-  magic_bytes = (
-    b"\x89PNG\r\n\x1a\n",
-    b"GIF87a",
-    b"GIF89a",
-    b"PK\x03\x04",  # zip
-  )
+def _parse_directive(line: str, config: Config) -> None:
+  """Handle lines starting with '@'."""
+  parts = line.split(None, 2)
+  directive = parts[0]
 
-  sql_keywords = (
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "UNION",
-    "DROP",
-  )
+  if directive == "@include":
+    if len(parts) < 2:
+      raise ConfigError("@include requires a path")
+    path = parts[1].strip('"').strip("'")
+    if path.startswith("/etc/") or path.startswith("/opt/"):
+      config.includes.append(path)
+    elif path.startswith("~/.config/"):
+      config.includes.append(path)
+    elif path.startswith("./") or path.startswith("../"):
+      config.includes.append(path)
+    else:
+      raise ConfigError(f"Unsafe include path: {path}")
 
-  # Help Atheris by ensuring this code gets instrumented.
-  # (instrument_func will patch code objects and register literals.)
-  text = data.decode("utf-8", "ignore")
+  elif directive == "@define":
+    if len(parts) < 3:
+      raise ConfigError("@define requires NAME and VALUE")
+    name, value = parts[1], parts[2]
+    if not name.isupper():
+      raise ConfigError(f"Macro names must be uppercase: {name}")
+    config.macros[name] = value
 
-  # Gate 1: looks like an HTTP request.
-  first_line = text.split("\n", 1)[0]
-  if not any(first_line.startswith(m + " ") for m in http_methods):
-    return
+  elif directive == "@version":
+    if len(parts) < 2:
+      raise ConfigError("@version requires a version string")
+    version = parts[1]
+    major, _, rest = version.partition(".")
+    minor, _, patch = rest.partition(".")
+    # Bug: unchecked int conversion can raise on garbage input
+    maj = int(major)
+    if maj < 1 or maj > 5:
+      raise ConfigError(f"Unsupported config version: {maj}")
 
-  # Gate 2: requires a plausible path and query.
-  if " HTTP/1.1" not in first_line and " HTTP/2" not in first_line:
-    return
-
-  # Parse the path.
-  parts = first_line.split(" ")
-  if len(parts) < 2:
-    return
-  path = parts[1]
-
-  # Gate 3: focus on a few realistic endpoints.
-  if not (path.startswith("/api/") or path.startswith("/v1/") or path.startswith("/admin/")):
-    return
-
-  # Split headers/body.
-  head, _, body = text.partition("\n\n")
-  headers = _parse_headers(head)
-
-  # Gate 4: require some known header names.
-  if not any(h in headers for h in header_names):
-    return
-
-  mode = headers.get("X-Mode", "")
-  if mode not in ("fast", "safe", "debug"):
-    return
-
-  # Query string parsing — introduces lots of structured branches.
-  query = ""
-  if "?" in path:
-    _, query = path.split("?", 1)
-
-  qs = urllib.parse.parse_qs(query, keep_blank_values=True)
-
-  # Gate 5: require specific parameters.
-  if "action" not in qs or "id" not in qs:
-    return
-
-  action = (qs.get("action") or [""])[0]
-  if action not in ("create", "update", "delete", "preview"):
-    return
-
-  # Gate 6: magic bytes condition.
-  if not any(m in data for m in magic_bytes):
-    return
-
-  content_type = headers.get("Content-Type", "")
-  if content_type not in content_types:
-    return
-
-  # Body parsing: JSON, form, or plain.
-  if content_type == "application/json":
-    # Gate 7: must look like JSON.
-    if not (body.lstrip().startswith("{") and body.rstrip().endswith("}")):
-      return
-    try:
-      obj = json.loads(body)
-    except Exception:
-      return
-
-    # Gate 8: require nested keys.
-    if not isinstance(obj, dict):
-      return
-    if obj.get("type") not in ("job", "task", "report"):
-      return
-    meta = obj.get("meta")
-    if not isinstance(meta, dict):
-      return
-
-    token = meta.get("token", "")
-    if not isinstance(token, str) or not token.startswith("tok_"):
-      return
-
-    # Gate 9: base64 branch.
-    payload = obj.get("payload", "")
-    if not isinstance(payload, str) or not payload.startswith("b64:"):
-      return
-
-    try:
-      decoded = base64.b64decode(payload[4:], validate=False)
-    except Exception:
-      return
-
-    # Gate 10: regex branch that benefits from dictionary literals.
-    # (Avoid catastrophic patterns; keep it simple.)
-    if not re.search(r"^ID-[0-9a-f]{8}$", decoded.decode("ascii", "ignore")):
-      return
-
-    # Intentional “bug” trigger to measure time-to-reach.
-    # Needs multiple conditions so it won’t be hit immediately.
-    if headers.get("X-Exploit") == "0xdeadbeef" and obj.get("type") == "report":
-      raise RuntimeError("Intentional crash: reached deep JSON + literal path")
-
-  elif content_type == "application/x-www-form-urlencoded":
-    form = urllib.parse.parse_qs(body, keep_blank_values=True)
-    if (form.get("user") or [""])[0] != "admin":
-      return
-
-    # Gate via SQL-ish keywords.
-    stmt = (form.get("q") or [""])[0]
-    if not any(k in stmt.upper() for k in sql_keywords):
-      return
-
-    if headers.get("X-Debug") == "1" and "DROP" in stmt.upper():
-      raise RuntimeError("Intentional crash: reached form + SQL-ish path")
+  elif directive == "@encoding":
+    if len(parts) < 2:
+      raise ConfigError("@encoding requires a value")
+    enc = parts[1].lower()
+    if enc not in ("utf-8", "ascii", "latin-1", "utf-16"):
+      raise ConfigError(f"Unsupported encoding: {enc}")
 
   else:
-    # Plain text branch.
-    if "BEGIN" not in body.upper() or "COMMIT" not in body.upper():
-      return
+    raise ConfigError(f"Unknown directive: {directive}")
+
+
+def _validate_database(key: str, value: str) -> None:
+  """Validate keys in the [database] section."""
+  if key == "engine":
+    if value not in ("postgresql", "mysql", "sqlite", "mariadb"):
+      raise ConfigError(f"Unknown database engine: {value}")
+  elif key == "host":
+    if not value or len(value) > 253:
+      raise ConfigError("Invalid hostname")
+  elif key == "port":
+    port = int(value)
+    if port < 1 or port > 65535:
+      raise ConfigError(f"Port out of range: {port}")
+  elif key == "name":
+    if not value.isidentifier():
+      raise ConfigError(f"Invalid database name: {value}")
+  elif key == "pool_size":
+    size = int(value)
+    # Bug: signed comparison allows negative pool sizes
+    if size > 100:
+      raise ConfigError(f"Pool too large: {size}")
+  elif key == "ssl_mode":
+    if value not in ("disable", "require", "verify-ca", "verify-full"):
+      raise ConfigError(f"Unknown ssl_mode: {value}")
+  elif key == "timeout":
+    timeout = float(value)
+    if timeout <= 0:
+      raise ConfigError("Timeout must be positive")
+
+
+def _validate_server(key: str, value: str) -> None:
+  """Validate keys in the [server] section."""
+  if key == "bind":
+    if value not in ("0.0.0.0", "127.0.0.1", "::1", "::"):
+      # Accept dotted-quad addresses
+      parts = value.split(".")
+      if len(parts) != 4:
+        raise ConfigError(f"Invalid bind address: {value}")
+  elif key == "workers":
+    w = int(value)
+    if w < 1 or w > 64:
+      raise ConfigError(f"Invalid worker count: {w}")
+  elif key == "mode":
+    if value not in ("development", "production", "staging", "testing"):
+      raise ConfigError(f"Unknown server mode: {value}")
+  elif key == "log_level":
+    if value.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+      raise ConfigError(f"Unknown log level: {value}")
+  elif key == "max_request_size":
+    # Bug: no overflow check on extremely large values
+    size = int(value)
+    buf = bytearray(min(size, 1024))  # noqa: F841
+
+
+def _validate_auth(key: str, value: str) -> None:
+  """Validate keys in the [auth] section."""
+  if key == "method":
+    if value not in ("token", "oauth2", "basic", "ldap", "saml", "certificate"):
+      raise ConfigError(f"Unknown auth method: {value}")
+  elif key == "token_prefix":
+    if value not in ("Bearer", "Token", "Api-Key", "JWT"):
+      raise ConfigError(f"Unknown token prefix: {value}")
+  elif key == "session_ttl":
+    ttl = int(value)
+    if ttl < 60 or ttl > 86400:
+      raise ConfigError(f"Session TTL out of range: {ttl}")
+  elif key == "secret_key":
+    if len(value) < 16:
+      raise ConfigError("Secret key too short")
+    # Bug: secret key stored as-is (no hashing)
+  elif key == "allowed_origins":
+    origins = value.split(",")
+    for origin in origins:
+      origin = origin.strip()
+      if not (origin.startswith("http://") or origin.startswith("https://")):
+        raise ConfigError(f"Origin must start with http(s)://: {origin}")
+
+
+def _validate_logging(key: str, value: str) -> None:
+  """Validate keys in the [logging] section."""
+  if key == "format":
+    if value not in ("json", "text", "structured", "syslog"):
+      raise ConfigError(f"Unknown log format: {value}")
+  elif key == "output":
+    if value not in ("stdout", "stderr", "file", "syslog", "journald"):
+      raise ConfigError(f"Unknown log output: {value}")
+  elif key == "file_path":
+    if not (value.startswith("/var/log/") or value.startswith("./logs/")):
+      raise ConfigError(f"Log path not in allowed directory: {value}")
+  elif key == "rotation":
+    if value not in ("daily", "weekly", "size", "none"):
+      raise ConfigError(f"Unknown rotation policy: {value}")
+  elif key == "max_size_mb":
+    mb = int(value)
+    if mb < 1 or mb > 10240:
+      raise ConfigError(f"Max log size out of range: {mb}")
+
+
+def _validate_cache(key: str, value: str) -> None:
+  """Validate keys in the [cache] section."""
+  if key == "backend":
+    if value not in ("redis", "memcached", "memory", "disk", "none"):
+      raise ConfigError(f"Unknown cache backend: {value}")
+  elif key == "ttl":
+    ttl = int(value)
+    if ttl < 0:
+      raise ConfigError(f"Negative TTL: {ttl}")
+  elif key == "prefix":
+    if not value.isidentifier():
+      raise ConfigError(f"Invalid cache prefix: {value}")
+  elif key == "serializer":
+    if value not in ("json", "pickle", "msgpack", "protobuf"):
+      raise ConfigError(f"Unknown serializer: {value}")
+
+
+def _validate_features(key: str, value: str) -> None:
+  """Validate keys in the [features] section."""
+  if key not in (
+      "enable_experimental",
+      "enable_beta",
+      "dark_mode",
+      "telemetry",
+      "auto_update",
+      "notifications",
+  ):
+    raise ConfigError(f"Unknown feature flag: {key}")
+  if value.lower() not in ("true", "false", "on", "off", "1", "0"):
+    raise ConfigError(f"Feature flag must be boolean: {value}")
+
+
+_SECTION_VALIDATORS = {
+  "database": _validate_database,
+  "server": _validate_server,
+  "auth": _validate_auth,
+  "logging": _validate_logging,
+  "cache": _validate_cache,
+  "features": _validate_features,
+}
+
+
+def parse_config(text: str) -> Config:
+  """Parse a configuration file from text.
+
+  This is the main entry point that the fuzzer exercises.
+  """
+  config = Config()
+
+  for lineno, raw_line in enumerate(text.splitlines(), 1):
+    line = raw_line.strip()
+
+    # Skip empty lines and comments.
+    if not line or line.startswith("#"):
+      continue
+
+    # Directives.
+    if line.startswith("@"):
+      _parse_directive(line, config)
+      continue
+
+    # Section header.
+    if line.startswith("[") and line.endswith("]"):
+      section_name = line[1:-1].strip().lower()
+      if section_name not in _SECTION_VALIDATORS:
+        raise ConfigError(
+            f"Line {lineno}: unknown section [{section_name}]"
+        )
+      config._current_section = section_name
+      if section_name not in config.sections:
+        config.sections[section_name] = {}
+      continue
+
+    # Key = value.
+    if "=" in line:
+      if config._current_section is None:
+        raise ConfigError(
+            f"Line {lineno}: key-value pair outside of section"
+        )
+      key, _, value = line.partition("=")
+      key = key.strip().lower()
+      value = value.strip().strip('"').strip("'")
+
+      # Macro expansion.
+      for macro_name, macro_value in config.macros.items():
+        value = value.replace(f"${{{macro_name}}}", macro_value)
+
+      # Validate against section-specific rules.
+      validator = _SECTION_VALIDATORS.get(config._current_section)
+      if validator:
+        validator(key, value)
+
+      config.sections[config._current_section][key] = value
+      continue
+
+    raise ConfigError(f"Line {lineno}: unrecognised syntax")
+
+  return config
+
+
+# ---------------------------------------------------------------------------
+# Fuzzer harness
+# ---------------------------------------------------------------------------
 
 
 def TestOneInput(data: bytes) -> None:
-  _interesting_branching_logic(data)
+  text = data.decode("utf-8", "ignore")
+  try:
+    parse_config(text)
+  except (ConfigError, ValueError, OverflowError):
+    pass
 
 
 def main() -> None:
-  # Ensure our own target code is instrumented (and thus literals registered).
-  atheris.instrument_func(_interesting_branching_logic)
+  # Instrument the parser functions so their string literals are registered.
+  atheris.instrument_func(parse_config)
+  atheris.instrument_func(_parse_directive)
+  atheris.instrument_func(_validate_database)
+  atheris.instrument_func(_validate_server)
+  atheris.instrument_func(_validate_auth)
+  atheris.instrument_func(_validate_logging)
+  atheris.instrument_func(_validate_cache)
+  atheris.instrument_func(_validate_features)
 
-  # Optional debug: show how many literals were registered (only available on
-  # modified Atheris that exposes get_string_literals()).
   if (
       "ATHERIS_LITERALS_DEBUG" in os.environ
       and hasattr(atheris, "get_string_literals")
