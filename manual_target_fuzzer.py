@@ -1,10 +1,20 @@
-"""Fuzz target: a simple config-file parser.
+"""Fuzz target: a structured log / event processor.
 
-This is a realistic target that mimics how real-world applications parse
-structured text configuration.  It naturally contains many string/bytes
-literals in comparisons (section names, directive keywords, option values)
-that are hard to discover through random mutation alone but become easily
-reachable when the fuzzer has a dictionary of those literals.
+This is a realistic target that mimics how applications parse structured
+log lines and event streams.  Crucially, it uses string operations that
+Atheris's existing _trace_cmp (COMPARE_OP hook) does NOT cover:
+
+  - ``"needle" in haystack``  (CONTAINS_OP, not COMPARE_OP)
+  - ``str.find()`` / ``str.index()``
+  - ``str.split(delimiter)``
+  - ``str.count()``
+  - ``str.replace()``
+  - dictionary key lookups (``d[key]``, ``key in d``)
+
+These are all common real-world patterns.  The string literals used in
+these operations are invisible to the baseline fuzzer but become available
+as dictionary entries when literal-emission is active — giving the
+modified build a clear advantage.
 """
 
 from __future__ import annotations
@@ -29,278 +39,226 @@ except ImportError:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# A small but realistic config-file parser.
-#
-# Supports:
-#   [section]           -- section headers
-#   key = value         -- key-value pairs
-#   @include <path>     -- directives
-#   @define NAME VALUE  -- macro definitions
-#   # comment           -- line comments
-#
-# Sections recognised: database, server, auth, logging, cache, features
-# Each section has its own set of known keys and valid values.
-# Several real bugs are embedded behind natural parsing logic.
+# Event severity levels — used via dictionary key lookup, NOT comparison.
+# ---------------------------------------------------------------------------
+_SEVERITY_WEIGHTS: dict[str, int] = {
+    "TRACE": 0,
+    "DEBUG": 1,
+    "INFO": 2,
+    "WARN": 3,
+    "ERROR": 4,
+    "FATAL": 5,
+}
+
+# ---------------------------------------------------------------------------
+# Known subsystem tags — checked via ``tag in _KNOWN_SUBSYSTEMS`` which
+# compiles to CONTAINS_OP on the set, not COMPARE_OP.
+# ---------------------------------------------------------------------------
+_KNOWN_SUBSYSTEMS: set[str] = {
+    "auth",
+    "database",
+    "cache",
+    "gateway",
+    "scheduler",
+    "worker",
+    "billing",
+    "notification",
+}
+
+# ---------------------------------------------------------------------------
+# Action dispatch table — looked up with ``_ACTION_HANDLERS[action]``.
 # ---------------------------------------------------------------------------
 
-
-class ConfigError(Exception):
-  """Raised on invalid configuration."""
-
-
-class Config:
-  """Parsed configuration container."""
-
-  def __init__(self):
-    self.sections: dict[str, dict[str, str]] = {}
-    self.macros: dict[str, str] = {}
-    self.includes: list[str] = []
-    self._current_section: str | None = None
+# Counters that make branches observable to coverage instrumentation.
+_stats: dict[str, int] = {}
 
 
-def _parse_directive(line: str, config: Config) -> None:
-  """Handle lines starting with '@'."""
-  parts = line.split(None, 2)
-  directive = parts[0]
-
-  if directive == "@include":
-    if len(parts) < 2:
-      raise ConfigError("@include requires a path")
-    path = parts[1].strip('"').strip("'")
-    if path.startswith("/etc/") or path.startswith("/opt/"):
-      config.includes.append(path)
-    elif path.startswith("~/.config/"):
-      config.includes.append(path)
-    elif path.startswith("./") or path.startswith("../"):
-      config.includes.append(path)
-    else:
-      raise ConfigError(f"Unsafe include path: {path}")
-
-  elif directive == "@define":
-    if len(parts) < 3:
-      raise ConfigError("@define requires NAME and VALUE")
-    name, value = parts[1], parts[2]
-    if not name.isupper():
-      raise ConfigError(f"Macro names must be uppercase: {name}")
-    config.macros[name] = value
-
-  elif directive == "@version":
-    if len(parts) < 2:
-      raise ConfigError("@version requires a version string")
-    version = parts[1]
-    major, _, rest = version.partition(".")
-    minor, _, patch = rest.partition(".")
-    # Bug: unchecked int conversion can raise on garbage input
-    maj = int(major)
-    if maj < 1 or maj > 5:
-      raise ConfigError(f"Unsupported config version: {maj}")
-
-  elif directive == "@encoding":
-    if len(parts) < 2:
-      raise ConfigError("@encoding requires a value")
-    enc = parts[1].lower()
-    if enc not in ("utf-8", "ascii", "latin-1", "utf-16"):
-      raise ConfigError(f"Unsupported encoding: {enc}")
-
-  else:
-    raise ConfigError(f"Unknown directive: {directive}")
+def _handle_login(fields: dict[str, str]) -> None:
+  user = fields.get("user", "")
+  # ``"admin" in user`` uses CONTAINS_OP
+  if "admin" in user:
+    _stats["admin_login"] = _stats.get("admin_login", 0) + 1
+  if "root" in user:
+    _stats["root_login"] = _stats.get("root_login", 0) + 1
+  method = fields.get("method", "")
+  if "oauth" in method:
+    _stats["oauth"] = _stats.get("oauth", 0) + 1
+  elif "certificate" in method:
+    _stats["cert"] = _stats.get("cert", 0) + 1
 
 
-def _validate_database(key: str, value: str) -> None:
-  """Validate keys in the [database] section."""
-  if key == "engine":
-    if value not in ("postgresql", "mysql", "sqlite", "mariadb"):
-      raise ConfigError(f"Unknown database engine: {value}")
-  elif key == "host":
-    if not value or len(value) > 253:
-      raise ConfigError("Invalid hostname")
-  elif key == "port":
-    port = int(value)
-    if port < 1 or port > 65535:
-      raise ConfigError(f"Port out of range: {port}")
-  elif key == "name":
-    if not value.isidentifier():
-      raise ConfigError(f"Invalid database name: {value}")
-  elif key == "pool_size":
-    size = int(value)
-    # Bug: signed comparison allows negative pool sizes
-    if size > 100:
-      raise ConfigError(f"Pool too large: {size}")
-  elif key == "ssl_mode":
-    if value not in ("disable", "require", "verify-ca", "verify-full"):
-      raise ConfigError(f"Unknown ssl_mode: {value}")
-  elif key == "timeout":
-    timeout = float(value)
-    if timeout <= 0:
-      raise ConfigError("Timeout must be positive")
+def _handle_query(fields: dict[str, str]) -> None:
+  sql = fields.get("sql", "")
+  # All of these are CONTAINS_OP — not hooked by _trace_cmp
+  if "SELECT" in sql:
+    _stats["select"] = _stats.get("select", 0) + 1
+  if "INSERT" in sql:
+    _stats["insert"] = _stats.get("insert", 0) + 1
+  if "UPDATE" in sql:
+    _stats["update"] = _stats.get("update", 0) + 1
+  if "DELETE" in sql:
+    _stats["delete"] = _stats.get("delete", 0) + 1
+  if "DROP" in sql:
+    _stats["drop"] = _stats.get("drop", 0) + 1
+    # ``sql.count()`` — not hooked
+    if sql.count("DROP") > 1 and "CASCADE" in sql:
+      _stats["dangerous_drop"] = _stats.get("dangerous_drop", 0) + 1
 
 
-def _validate_server(key: str, value: str) -> None:
-  """Validate keys in the [server] section."""
-  if key == "bind":
-    if value not in ("0.0.0.0", "127.0.0.1", "::1", "::"):
-      # Accept dotted-quad addresses
-      parts = value.split(".")
-      if len(parts) != 4:
-        raise ConfigError(f"Invalid bind address: {value}")
-  elif key == "workers":
-    w = int(value)
-    if w < 1 or w > 64:
-      raise ConfigError(f"Invalid worker count: {w}")
-  elif key == "mode":
-    if value not in ("development", "production", "staging", "testing"):
-      raise ConfigError(f"Unknown server mode: {value}")
-  elif key == "log_level":
-    if value.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-      raise ConfigError(f"Unknown log level: {value}")
-  elif key == "max_request_size":
-    # Bug: no overflow check on extremely large values
-    size = int(value)
-    buf = bytearray(min(size, 1024))  # noqa: F841
+def _handle_request(fields: dict[str, str]) -> None:
+  path = fields.get("path", "")
+  # ``str.find()`` — not hooked by _trace_cmp
+  api_pos = path.find("/api/v2/")
+  if api_pos >= 0:
+    _stats["api_v2"] = _stats.get("api_v2", 0) + 1
+    # deeper: what comes after /api/v2/?
+    rest = path[api_pos + 8:]
+    # ``str.find()`` again
+    if rest.find("users") >= 0:
+      _stats["api_v2_users"] = _stats.get("api_v2_users", 0) + 1
+    if rest.find("billing") >= 0:
+      _stats["api_v2_billing"] = _stats.get("api_v2_billing", 0) + 1
+    if rest.find("admin") >= 0:
+      _stats["api_v2_admin"] = _stats.get("api_v2_admin", 0) + 1
+
+  internal_pos = path.find("/internal/")
+  if internal_pos >= 0:
+    _stats["internal"] = _stats.get("internal", 0) + 1
+    after = path[internal_pos + 10:]
+    if after.find("healthz") >= 0:
+      _stats["healthz"] = _stats.get("healthz", 0) + 1
+    if after.find("metrics") >= 0:
+      _stats["metrics"] = _stats.get("metrics", 0) + 1
+    if after.find("debug") >= 0:
+      _stats["debug_endpoint"] = _stats.get("debug_endpoint", 0) + 1
 
 
-def _validate_auth(key: str, value: str) -> None:
-  """Validate keys in the [auth] section."""
-  if key == "method":
-    if value not in ("token", "oauth2", "basic", "ldap", "saml", "certificate"):
-      raise ConfigError(f"Unknown auth method: {value}")
-  elif key == "token_prefix":
-    if value not in ("Bearer", "Token", "Api-Key", "JWT"):
-      raise ConfigError(f"Unknown token prefix: {value}")
-  elif key == "session_ttl":
-    ttl = int(value)
-    if ttl < 60 or ttl > 86400:
-      raise ConfigError(f"Session TTL out of range: {ttl}")
-  elif key == "secret_key":
-    if len(value) < 16:
-      raise ConfigError("Secret key too short")
-    # Bug: secret key stored as-is (no hashing)
-  elif key == "allowed_origins":
-    origins = value.split(",")
-    for origin in origins:
-      origin = origin.strip()
-      if not (origin.startswith("http://") or origin.startswith("https://")):
-        raise ConfigError(f"Origin must start with http(s)://: {origin}")
+def _handle_cache(fields: dict[str, str]) -> None:
+  op = fields.get("op", "")
+  # CONTAINS_OP checks
+  if "evict" in op:
+    _stats["cache_evict"] = _stats.get("cache_evict", 0) + 1
+  if "expire" in op:
+    _stats["cache_expire"] = _stats.get("cache_expire", 0) + 1
+  if "flush_all" in op:
+    _stats["cache_flush"] = _stats.get("cache_flush", 0) + 1
+    backend = fields.get("backend", "")
+    if "redis" in backend:
+      _stats["redis_flush"] = _stats.get("redis_flush", 0) + 1
+    if "memcached" in backend:
+      _stats["memcached_flush"] = _stats.get("memcached_flush", 0) + 1
 
 
-def _validate_logging(key: str, value: str) -> None:
-  """Validate keys in the [logging] section."""
-  if key == "format":
-    if value not in ("json", "text", "structured", "syslog"):
-      raise ConfigError(f"Unknown log format: {value}")
-  elif key == "output":
-    if value not in ("stdout", "stderr", "file", "syslog", "journald"):
-      raise ConfigError(f"Unknown log output: {value}")
-  elif key == "file_path":
-    if not (value.startswith("/var/log/") or value.startswith("./logs/")):
-      raise ConfigError(f"Log path not in allowed directory: {value}")
-  elif key == "rotation":
-    if value not in ("daily", "weekly", "size", "none"):
-      raise ConfigError(f"Unknown rotation policy: {value}")
-  elif key == "max_size_mb":
-    mb = int(value)
-    if mb < 1 or mb > 10240:
-      raise ConfigError(f"Max log size out of range: {mb}")
+def _handle_job(fields: dict[str, str]) -> None:
+  status = fields.get("status", "")
+  if "completed" in status:
+    _stats["job_done"] = _stats.get("job_done", 0) + 1
+  if "failed" in status:
+    _stats["job_fail"] = _stats.get("job_fail", 0) + 1
+    reason = fields.get("reason", "")
+    if "timeout" in reason:
+      _stats["job_timeout"] = _stats.get("job_timeout", 0) + 1
+    if "oom" in reason:
+      _stats["job_oom"] = _stats.get("job_oom", 0) + 1
+  if "retrying" in status:
+    _stats["job_retry"] = _stats.get("job_retry", 0) + 1
 
 
-def _validate_cache(key: str, value: str) -> None:
-  """Validate keys in the [cache] section."""
-  if key == "backend":
-    if value not in ("redis", "memcached", "memory", "disk", "none"):
-      raise ConfigError(f"Unknown cache backend: {value}")
-  elif key == "ttl":
-    ttl = int(value)
-    if ttl < 0:
-      raise ConfigError(f"Negative TTL: {ttl}")
-  elif key == "prefix":
-    if not value.isidentifier():
-      raise ConfigError(f"Invalid cache prefix: {value}")
-  elif key == "serializer":
-    if value not in ("json", "pickle", "msgpack", "protobuf"):
-      raise ConfigError(f"Unknown serializer: {value}")
-
-
-def _validate_features(key: str, value: str) -> None:
-  """Validate keys in the [features] section."""
-  if key not in (
-      "enable_experimental",
-      "enable_beta",
-      "dark_mode",
-      "telemetry",
-      "auto_update",
-      "notifications",
-  ):
-    raise ConfigError(f"Unknown feature flag: {key}")
-  if value.lower() not in ("true", "false", "on", "off", "1", "0"):
-    raise ConfigError(f"Feature flag must be boolean: {value}")
-
-
-_SECTION_VALIDATORS = {
-  "database": _validate_database,
-  "server": _validate_server,
-  "auth": _validate_auth,
-  "logging": _validate_logging,
-  "cache": _validate_cache,
-  "features": _validate_features,
+_ACTION_HANDLERS: dict[str, object] = {
+    "login": _handle_login,
+    "query": _handle_query,
+    "request": _handle_request,
+    "cache_op": _handle_cache,
+    "job": _handle_job,
 }
 
 
-def parse_config(text: str) -> Config:
-  """Parse a configuration file from text.
+def process_event(line: str) -> None:
+  """Parse and process a single structured log line.
 
-  This is the main entry point that the fuzzer exercises.
+  Expected format (pipe-delimited):
+    SEVERITY|subsystem|action|key1=val1;key2=val2;...
+
+  Example:
+    INFO|database|query|sql=SELECT * FROM users;duration=42
   """
-  config = Config()
+  # --- str.split() with a specific delimiter (not hooked) -----------------
+  parts = line.split("|")
+  if len(parts) < 4:
+    return
 
-  for lineno, raw_line in enumerate(text.splitlines(), 1):
-    line = raw_line.strip()
+  severity_str = parts[0].strip()
+  subsystem = parts[1].strip()
+  action = parts[2].strip()
+  raw_fields = parts[3].strip()
 
-    # Skip empty lines and comments.
-    if not line or line.startswith("#"):
+  # --- dictionary key lookup (not COMPARE_OP) -----------------------------
+  if severity_str not in _SEVERITY_WEIGHTS:
+    return
+  severity = _SEVERITY_WEIGHTS[severity_str]
+
+  # --- set membership via CONTAINS_OP (not COMPARE_OP) --------------------
+  if subsystem not in _KNOWN_SUBSYSTEMS:
+    return
+
+  # --- parse key=value pairs using str.split / str.find -------------------
+  fields: dict[str, str] = {}
+  for pair in raw_fields.split(";"):
+    eq_pos = pair.find("=")
+    if eq_pos < 0:
       continue
+    k = pair[:eq_pos].strip()
+    v = pair[eq_pos + 1:].strip()
+    # --- str.replace() (not hooked) ---
+    v = v.replace("\\n", "\n").replace("\\t", "\t")
+    fields[k] = v
 
-    # Directives.
-    if line.startswith("@"):
-      _parse_directive(line, config)
+  # --- action dispatch via dictionary lookup (not COMPARE_OP) -------------
+  handler = _ACTION_HANDLERS.get(action)
+  if handler is None:
+    return
+  handler(fields)
+
+  # --- more CONTAINS_OP / str.find patterns on combined fields ------------
+  if severity >= 4:  # ERROR or FATAL
+    msg = fields.get("msg", "")
+    if "stack_overflow" in msg:
+      _stats["stack_overflow"] = _stats.get("stack_overflow", 0) + 1
+    if "null_pointer" in msg:
+      _stats["null_pointer"] = _stats.get("null_pointer", 0) + 1
+    if "segfault" in msg:
+      _stats["segfault"] = _stats.get("segfault", 0) + 1
+    # str.find on the trace field
+    trace = fields.get("trace", "")
+    if trace.find("libpthread") >= 0:
+      _stats["pthread_crash"] = _stats.get("pthread_crash", 0) + 1
+    if trace.find("malloc") >= 0:
+      _stats["malloc_crash"] = _stats.get("malloc_crash", 0) + 1
+
+  # --- correlation: subsystem + action combos (all via CONTAINS_OP) -------
+  if subsystem in ("auth", "gateway") and action in ("login", "request"):
+    token = fields.get("token", "")
+    if "expired" in token:
+      _stats["expired_token"] = _stats.get("expired_token", 0) + 1
+    if "revoked" in token:
+      _stats["revoked_token"] = _stats.get("revoked_token", 0) + 1
+    ua = fields.get("user_agent", "")
+    if "python-requests" in ua:
+      _stats["bot_traffic"] = _stats.get("bot_traffic", 0) + 1
+    if "curl" in ua:
+      _stats["curl_traffic"] = _stats.get("curl_traffic", 0) + 1
+
+
+def process_batch(text: str) -> None:
+  """Process multiple log lines (newline-separated)."""
+  for line in text.splitlines():
+    line = line.strip()
+    if not line:
       continue
-
-    # Section header.
-    if line.startswith("[") and line.endswith("]"):
-      section_name = line[1:-1].strip().lower()
-      if section_name not in _SECTION_VALIDATORS:
-        raise ConfigError(
-            f"Line {lineno}: unknown section [{section_name}]"
-        )
-      config._current_section = section_name
-      if section_name not in config.sections:
-        config.sections[section_name] = {}
+    # Skip comment lines (str.find pattern)
+    if line.find("//") == 0 or line.find("#") == 0:
       continue
-
-    # Key = value.
-    if "=" in line:
-      if config._current_section is None:
-        raise ConfigError(
-            f"Line {lineno}: key-value pair outside of section"
-        )
-      key, _, value = line.partition("=")
-      key = key.strip().lower()
-      value = value.strip().strip('"').strip("'")
-
-      # Macro expansion.
-      for macro_name, macro_value in config.macros.items():
-        value = value.replace(f"${{{macro_name}}}", macro_value)
-
-      # Validate against section-specific rules.
-      validator = _SECTION_VALIDATORS.get(config._current_section)
-      if validator:
-        validator(key, value)
-
-      config.sections[config._current_section][key] = value
-      continue
-
-    raise ConfigError(f"Line {lineno}: unrecognised syntax")
-
-  return config
+    process_event(line)
 
 
 # ---------------------------------------------------------------------------
@@ -311,21 +269,20 @@ def parse_config(text: str) -> Config:
 def TestOneInput(data: bytes) -> None:
   text = data.decode("utf-8", "ignore")
   try:
-    parse_config(text)
-  except (ConfigError, ValueError, OverflowError):
+    process_batch(text)
+  except (ValueError, KeyError, IndexError, OverflowError):
     pass
 
 
 def main() -> None:
-  # Instrument the parser functions so their string literals are registered.
-  atheris.instrument_func(parse_config)
-  atheris.instrument_func(_parse_directive)
-  atheris.instrument_func(_validate_database)
-  atheris.instrument_func(_validate_server)
-  atheris.instrument_func(_validate_auth)
-  atheris.instrument_func(_validate_logging)
-  atheris.instrument_func(_validate_cache)
-  atheris.instrument_func(_validate_features)
+  # Instrument all parser/handler functions.
+  atheris.instrument_func(process_batch)
+  atheris.instrument_func(process_event)
+  atheris.instrument_func(_handle_login)
+  atheris.instrument_func(_handle_query)
+  atheris.instrument_func(_handle_request)
+  atheris.instrument_func(_handle_cache)
+  atheris.instrument_func(_handle_job)
 
   if (
       "ATHERIS_LITERALS_DEBUG" in os.environ
@@ -334,6 +291,9 @@ def main() -> None:
     try:
       lits = atheris.get_string_literals()
       print(f"[DEBUG] registered literals: {len(lits)}", file=sys.stderr)
+      if "ATHERIS_LITERALS_SHOW" in os.environ:
+        for lit in sorted(lits, key=lambda x: (isinstance(x, bytes), x)):
+          print(f"  {lit!r}", file=sys.stderr)
     except Exception:
       pass
 
