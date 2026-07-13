@@ -54,12 +54,16 @@ Literals used in any other context -- `"abc" in x`, `x.find("abc")`, dictionary
 lookups, and so on -- are invisible to the fuzzer. See
 [issue #48](https://github.com/google/atheris/issues/48).
 
-To capture these, the instrumentation can aggregate *every* string and bytes
-literal it encounters into a [libFuzzer
+To capture these, the instrumentation can aggregate the string and bytes
+literals it encounters into a [libFuzzer
 dictionary](https://llvm.org/docs/LibFuzzer.html#dictionaries). Collection is
-opt-in, because indiscriminately harvesting literals can pull in noise such as
-logging and formatting strings. Because the dictionary is written as a plain
-text file, it can be reviewed and trimmed before use.
+opt-in, because indiscriminately harvesting literals can pull in noise. To keep
+the dictionary useful, literals that are only ever passed to logging calls
+(`logging.info("...")`, `self.log.debug(...)`, and similar) are ignored, since
+they are almost never interesting comparison targets. Only literals that are
+actually loaded are considered, so unused constants such as docstrings are
+skipped too. Because the dictionary is written as a plain text file, it can
+still be reviewed and trimmed before use.
 
 ```python
 import atheris

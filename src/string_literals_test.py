@@ -13,12 +13,15 @@
 # limitations under the License.
 """Tests for string literal aggregation during instrumentation."""
 
+import logging
 import os
 import tempfile
 import unittest
 
 import atheris
 from atheris import instrument_bytecode
+
+_logger = logging.getLogger(__name__)
 
 
 class StringLiteralAggregationTest(unittest.TestCase):
@@ -81,6 +84,46 @@ class StringLiteralAggregationTest(unittest.TestCase):
     literals = self._collect(target)
     self.assertNotIn(b"a", literals)
     self.assertNotIn(b"__ATHERIS_INSTRUMENTED__", literals)
+
+  def test_ignores_logging_only_literals(self):
+    def target(x):
+      logging.info("logging_only_a")
+      _logger.debug("logging_only_b %s", x)
+      if x == "kept_literal":
+        return 1
+      return 0
+
+    literals = self._collect(target)
+    self.assertIn(b"kept_literal", literals)
+    self.assertNotIn(b"logging_only_a", literals)
+    self.assertNotIn(b"logging_only_b %s", literals)
+
+  def test_ignores_logging_on_attribute_receiver(self):
+    class Service:
+
+      def handle(self, x):
+        self.log.error("attr_logging_only")
+        return x == "attr_kept"
+
+    literals = self._collect(Service.handle)
+    self.assertIn(b"attr_kept", literals)
+    self.assertNotIn(b"attr_logging_only", literals)
+
+  def test_keeps_literal_used_outside_logging(self):
+    def target(x):
+      logging.warning("shared_literal")
+      return x == "shared_literal"
+
+    self.assertIn(b"shared_literal", self._collect(target))
+
+  def test_keeps_literals_for_non_logger_receivers(self):
+    def target(parser, x):
+      # A method named like a logging level, but on a non-logger receiver,
+      # must not be treated as a logging call.
+      parser.error("argparse_message")
+      return x
+
+    self.assertIn(b"argparse_message", self._collect(target))
 
   def test_disabled_by_default(self):
     self.assertFalse(instrument_bytecode._collect_literals)

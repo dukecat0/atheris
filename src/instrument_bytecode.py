@@ -71,16 +71,18 @@ debug_instrument_only_blocks: List[int] | None = None
 # comparison (e.g. `x == "abc"`) or in a hooked str method (startswith, ...).
 # Literals used in any other context (`"abc" in x`, `x.find("abc")`,
 # dictionary lookups, ...) are invisible to the fuzzer. When enabled, the
-# instrumentation collects *every* string and bytes literal it encounters and
+# instrumentation collects string and bytes literals it encounters and
 # aggregates them into a dictionary. This dictionary can then be written to a
 # libFuzzer dictionary file (see write_dictionary) and passed to the fuzzer via
 # `-dict=<file>`, which lets the mutator splice these tokens into inputs.
 #
 # Collection is opt-in because, as noted in
 # https://github.com/google/atheris/issues/48, indiscriminately harvesting
-# every literal can pull in noise such as logging and formatting strings. The
-# resulting dictionary file is plain text, so it can be reviewed and trimmed
-# before use.
+# every literal can pull in noise. To keep the dictionary useful, literals that
+# are only passed to logging calls (`logging.info("...")`, `self.log.debug(...)`
+# and similar) are ignored -- these are almost never interesting comparison
+# targets. The resulting dictionary file is plain text, so it can still be
+# reviewed and trimmed before use.
 # ---------------------------------------------------------------------------
 
 # Whether string/bytes literals should be aggregated during instrumentation.
@@ -144,9 +146,87 @@ def _register_literal(value: Union[str, bytes]) -> None:
   _literal_dictionary[encoded] = None
 
 
+# Method names that indicate a logging call. A literal that is only ever passed
+# to one of these methods (on a logging-related receiver) is ignored.
+_LOGGING_LEVEL_METHODS = frozenset({
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "fatal",
+    "log",
+})
+
+# Opcodes that load a named value (used to identify a method call's receiver).
+_NAME_LOAD_OPS = frozenset({
+    "LOAD_GLOBAL",
+    "LOAD_NAME",
+    "LOAD_FAST",
+    "LOAD_DEREF",
+    "LOAD_ATTR",
+    "LOAD_METHOD",
+})
+
+
+def _looks_like_logger(name: str) -> bool:
+  """Returns True if `name` looks like a logging module or logger object."""
+  return "log" in name.lower()
+
+
+def _find_logging_literal_positions(
+    instructions: List[dis.Instruction],
+) -> Set[int]:
+  """Returns indices of LOAD_CONST instructions that feed a logging call.
+
+  This is a best-effort, purely local heuristic: it looks for a method load
+  (`LOAD_METHOD`/`LOAD_ATTR`) of a logging level name whose receiver looks like
+  a logger, and marks the constants loaded as arguments to that call (up to the
+  next call instruction). Constants that are also used elsewhere are collected
+  from those other uses, so this only drops literals used *exclusively* for
+  logging.
+  """
+  ignore: Set[int] = set()
+  for i, instr in enumerate(instructions):
+    if instr.opname not in ("LOAD_METHOD", "LOAD_ATTR"):
+      continue
+    if instr.argval not in _LOGGING_LEVEL_METHODS:
+      continue
+    # The receiver is on the top of the stack, i.e. loaded just before.
+    if i == 0:
+      continue
+    receiver = instructions[i - 1]
+    if receiver.opname not in _NAME_LOAD_OPS or not isinstance(
+        receiver.argval, str
+    ):
+      continue
+    if not _looks_like_logger(receiver.argval):
+      continue
+    # Mark the constants pushed as arguments, up to the call itself.
+    for j in range(i + 1, len(instructions)):
+      if instructions[j].opname.startswith("CALL"):
+        break
+      if instructions[j].opname == "LOAD_CONST":
+        ignore.add(j)
+  return ignore
+
+
 def _collect_code_literals(code: types.CodeType) -> None:
-  """Collects all str/bytes literals from a code object's constants."""
-  for const in code.co_consts:
+  """Collects str/bytes literals loaded by a code object, excluding logging.
+
+  Only constants that are actually loaded (via LOAD_CONST) are considered, so
+  unused constants such as docstrings are naturally skipped. Constants passed
+  exclusively to logging calls are ignored.
+  """
+  instructions = list(dis.get_instructions(code))
+  logging_positions = _find_logging_literal_positions(instructions)
+
+  for i, instr in enumerate(instructions):
+    if instr.opname != "LOAD_CONST" or i in logging_positions:
+      continue
+    const = instr.argval
     if isinstance(const, (str, bytes)):
       _register_literal(const)
     elif isinstance(const, tuple):
