@@ -64,6 +64,137 @@ _HOOK_STR_FUNCTION = "_hook_str"
 debug_instrument_only_blocks: List[int] | None = None
 
 
+# ---------------------------------------------------------------------------
+# String literal aggregation.
+#
+# Atheris normally only learns about string/bytes literals that show up in a
+# comparison (e.g. `x == "abc"`) or in a hooked str method (startswith, ...).
+# Literals used in any other context (`"abc" in x`, `x.find("abc")`,
+# dictionary lookups, ...) are invisible to the fuzzer. When enabled, the
+# instrumentation collects *every* string and bytes literal it encounters and
+# aggregates them into a dictionary. This dictionary can then be written to a
+# libFuzzer dictionary file (see write_dictionary) and passed to the fuzzer via
+# `-dict=<file>`, which lets the mutator splice these tokens into inputs.
+#
+# Collection is opt-in because, as noted in
+# https://github.com/google/atheris/issues/48, indiscriminately harvesting
+# every literal can pull in noise such as logging and formatting strings. The
+# resulting dictionary file is plain text, so it can be reviewed and trimmed
+# before use.
+# ---------------------------------------------------------------------------
+
+# Whether string/bytes literals should be aggregated during instrumentation.
+_collect_literals: bool = False
+
+# Ordered, de-duplicated set of collected literals, stored as bytes (str
+# literals are encoded as UTF-8). A dict is used as an insertion-ordered set.
+_literal_dictionary: "collections.OrderedDict[bytes, None]" = (
+    collections.OrderedDict()
+)
+
+# Literals shorter/longer than these bounds are ignored. Very short literals
+# are rarely useful as fuzzing tokens, and very long ones are almost always
+# data blobs rather than interesting comparison targets.
+_MIN_LITERAL_LEN = 2
+_MAX_LITERAL_LEN = 4096
+
+
+def collect_string_literals(enable: bool = True) -> None:
+  """Enables (or disables) aggregation of string literals during instrumentation.
+
+  When enabled, subsequent instrumentation (via instrument_imports,
+  instrument_func, instrument_all, etc.) records every str and bytes literal it
+  encounters. Call this before instrumenting the code you want to harvest
+  literals from.
+
+  Args:
+    enable: Whether to collect literals.
+  """
+  global _collect_literals
+  _collect_literals = enable
+
+
+def clear_string_literals() -> None:
+  """Discards all literals collected so far."""
+  _literal_dictionary.clear()
+
+
+def get_string_literals() -> List[bytes]:
+  """Returns the aggregated literals, in the order they were first seen."""
+  return list(_literal_dictionary.keys())
+
+
+def _register_literal(value: Union[str, bytes]) -> None:
+  """Adds a single str/bytes literal to the aggregated dictionary."""
+  if isinstance(value, str):
+    try:
+      encoded = value.encode("utf-8", "surrogatepass")
+    except UnicodeEncodeError:
+      return
+  elif isinstance(value, bytes):
+    encoded = value
+  else:
+    return
+
+  if not _MIN_LITERAL_LEN <= len(encoded) <= _MAX_LITERAL_LEN:
+    return
+  if encoded == b"__ATHERIS_INSTRUMENTED__":
+    return
+
+  _literal_dictionary[encoded] = None
+
+
+def _collect_code_literals(code: types.CodeType) -> None:
+  """Collects all str/bytes literals from a code object's constants."""
+  for const in code.co_consts:
+    if isinstance(const, (str, bytes)):
+      _register_literal(const)
+    elif isinstance(const, tuple):
+      # Constant tuples show up for e.g. `x.startswith(("a", "b"))`.
+      for item in const:
+        if isinstance(item, (str, bytes)):
+          _register_literal(item)
+
+
+def _escape_dictionary_entry(entry: bytes) -> str:
+  """Formats a literal as a single libFuzzer dictionary entry.
+
+  See https://llvm.org/docs/LibFuzzer.html#dictionaries for the format. Bytes
+  are emitted verbatim when printable, and as `\\xHH` escapes otherwise.
+  """
+  out = ['"']
+  for byte in entry:
+    if byte == ord('"'):
+      out.append('\\"')
+    elif byte == ord("\\"):
+      out.append("\\\\")
+    elif 0x20 <= byte < 0x7F:
+      out.append(chr(byte))
+    else:
+      out.append("\\x%02x" % byte)
+  out.append('"')
+  return "".join(out)
+
+
+def write_dictionary(path: str) -> int:
+  """Writes the aggregated literals to a libFuzzer dictionary file.
+
+  The resulting file can be passed to the fuzzer with `-dict=<path>`. It is a
+  plain text file and may be reviewed and edited before use.
+
+  Args:
+    path: Destination path for the dictionary file.
+
+  Returns:
+    The number of entries written.
+  """
+  entries = get_string_literals()
+  with open(path, "w") as f:
+    for entry in entries:
+      f.write(_escape_dictionary_entry(entry) + "\n")
+  return len(entries)
+
+
 class UncalculatedArgSentinel:
   """Tracks args with values that need to be calculated.
 
@@ -945,6 +1076,12 @@ def patch_code(
     # This avoids comparison between str and bytes (BytesWarning).
     if isinstance(const, str) and const == "__ATHERIS_INSTRUMENTED__":
       return code
+
+  # Aggregate string/bytes literals before instrumentation adds its own
+  # constants. Nested code objects are collected via the recursive patch_code
+  # calls below.
+  if _collect_literals:
+    _collect_code_literals(code)
 
   inst = Instrumentor(code)
 

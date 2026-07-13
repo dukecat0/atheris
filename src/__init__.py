@@ -22,9 +22,13 @@ from .function_hooks import enabled_hooks
 from .function_hooks import gen_match
 from .import_hook import instrument_imports
 
+from .instrument_bytecode import clear_string_literals
+from .instrument_bytecode import collect_string_literals
+from .instrument_bytecode import get_string_literals
 from .instrument_bytecode import instrument_all
 from .instrument_bytecode import instrument_func
 from .instrument_bytecode import patch_code
+from .instrument_bytecode import write_dictionary
 
 # MyPy cannot find native code.
 from .native import _reserve_counter  # type: ignore[import]

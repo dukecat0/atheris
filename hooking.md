@@ -45,3 +45,42 @@ follow the pattern used for str hooking. Use a similar structure to the
 call to the new proxy function. This new proxy function should be defined in
 `function_hooks.py`, following a similar structure to `_hook_str`. Finally, add
 the new hook name to the `EnabledHooks` class.
+
+## Aggregating string literals into a fuzzing dictionary
+
+Atheris normally only learns about a string/bytes literal when it participates
+in a comparison (`x == "abc"`) or a hooked `str` method (`startswith`, etc.).
+Literals used in any other context -- `"abc" in x`, `x.find("abc")`, dictionary
+lookups, and so on -- are invisible to the fuzzer. See
+[issue #48](https://github.com/google/atheris/issues/48).
+
+To capture these, the instrumentation can aggregate *every* string and bytes
+literal it encounters into a [libFuzzer
+dictionary](https://llvm.org/docs/LibFuzzer.html#dictionaries). Collection is
+opt-in, because indiscriminately harvesting literals can pull in noise such as
+logging and formatting strings. Because the dictionary is written as a plain
+text file, it can be reviewed and trimmed before use.
+
+```python
+import atheris
+
+atheris.collect_string_literals()          # enable aggregation
+with atheris.instrument_imports():
+    import my_target                        # literals are collected on import
+atheris.write_dictionary("atheris.dict")   # write the libFuzzer dictionary
+```
+
+Then pass the dictionary to the fuzzer:
+
+```
+python ./fuzz.py -dict=atheris.dict
+```
+
+The relevant helpers, all exported from the top-level `atheris` module, are:
+
+* `collect_string_literals(enable=True)` -- enable/disable aggregation. Call it
+  before instrumenting the code you want to harvest literals from.
+* `get_string_literals()` -- return the aggregated literals (a list of `bytes`).
+* `write_dictionary(path)` -- write the aggregated literals to a libFuzzer
+  dictionary file; returns the number of entries written.
+* `clear_string_literals()` -- discard everything collected so far.
