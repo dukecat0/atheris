@@ -16,6 +16,7 @@
 import logging
 import os
 import tempfile
+import types
 import unittest
 
 import atheris
@@ -37,6 +38,18 @@ class StringLiteralAggregationTest(unittest.TestCase):
 
   def _collect(self, func):
     instrument_bytecode._collect_code_literals(func.__code__)
+    return atheris.get_string_literals()
+
+  def _collect_source(self, source):
+    """Compiles a module source and collects literals from all code objects."""
+
+    def walk(code):
+      instrument_bytecode._collect_code_literals(code)
+      for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+          walk(const)
+
+    walk(compile(source, "<string_literals_test>", "exec"))
     return atheris.get_string_literals()
 
   def test_collects_literals_from_many_contexts(self):
@@ -124,6 +137,79 @@ class StringLiteralAggregationTest(unittest.TestCase):
       return x
 
     self.assertIn(b"argparse_message", self._collect(target))
+
+  def test_collects_returned_literal(self):
+    # On Python 3.12/3.13 `return "literal"` compiles to RETURN_CONST rather
+    # than LOAD_CONST + RETURN_VALUE.
+    def target(x):
+      return "returned_literal"
+
+    self.assertIn(b"returned_literal", self._collect(target))
+
+  def test_ignores_module_docstring(self):
+    literals = self._collect_source(
+        '"""module docstring noise"""\nMAGIC = "kept_module_literal"\n'
+    )
+    self.assertIn(b"kept_module_literal", literals)
+    self.assertNotIn(b"module docstring noise", literals)
+
+  def test_ignores_class_docstring_and_machinery(self):
+    literals = self._collect_source(
+        "class SomeService:\n"
+        '  """class docstring noise"""\n'
+        '  marker = "kept_class_literal"\n'
+        "  def __init__(self):\n"
+        '    self.tracked_attribute = "kept_attr_value"\n'
+    )
+    self.assertIn(b"kept_class_literal", literals)
+    self.assertIn(b"kept_attr_value", literals)
+    self.assertNotIn(b"class docstring noise", literals)
+    # The class name is stored into __qualname__ by the class machinery, and
+    # on Python 3.13+ attribute names are stored into __static_attributes__.
+    self.assertNotIn(b"SomeService", literals)
+    self.assertNotIn(b"tracked_attribute", literals)
+
+  def test_ignores_dunder_metadata_assignments(self):
+    literals = self._collect_source('__version__ = "9.9.9_test_version"\n')
+    self.assertNotIn(b"9.9.9_test_version", literals)
+
+  def test_ignores_annotation_names(self):
+    literals = self._collect_source(
+        "def process(data: bytes, count: int = 3) -> None:\n"
+        '  if b"kept_body_token" in data:\n'
+        "    raise RuntimeError()\n"
+    )
+    self.assertIn(b"kept_body_token", literals)
+    self.assertNotIn(b"data", literals)
+    self.assertNotIn(b"count", literals)
+    self.assertNotIn(b"return", literals)
+
+  def test_ignores_future_style_annotations(self):
+    literals = self._collect_source(
+        "from __future__ import annotations\n"
+        "def process(data: bytes) -> SomeCustomType:\n"
+        "  return data\n"
+    )
+    self.assertNotIn(b"data", literals)
+    self.assertNotIn(b"bytes", literals)
+    self.assertNotIn(b"return", literals)
+    self.assertNotIn(b"SomeCustomType", literals)
+
+  def test_keeps_default_value_next_to_annotations(self):
+    literals = self._collect_source(
+        'def lookup(name: str = "fallback_name") -> str:\n'
+        "  return name\n"
+    )
+    self.assertIn(b"fallback_name", literals)
+    self.assertNotIn(b"name", literals)
+    self.assertNotIn(b"return", literals)
+
+  def test_keeps_literal_matching_annotation_name_used_in_body(self):
+    literals = self._collect_source(
+        "def handle(data: bytes) -> int:\n"
+        '  return 1 if b"data" in data else 0\n'
+    )
+    self.assertIn(b"data", literals)
 
   def test_disabled_by_default(self):
     self.assertFalse(instrument_bytecode._collect_literals)

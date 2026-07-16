@@ -58,12 +58,15 @@ To capture these, the instrumentation can aggregate the string and bytes
 literals it encounters into a [libFuzzer
 dictionary](https://llvm.org/docs/LibFuzzer.html#dictionaries). Collection is
 opt-in, because indiscriminately harvesting literals can pull in noise. To keep
-the dictionary useful, literals that are only ever passed to logging calls
-(`logging.info("...")`, `self.log.debug(...)`, and similar) are ignored, since
-they are almost never interesting comparison targets. Only literals that are
-actually loaded are considered, so unused constants such as docstrings are
-skipped too. Because the dictionary is written as a plain text file, it can
-still be reviewed and trimmed before use.
+the dictionary useful, literals that are almost never interesting comparison
+targets are ignored: literals only ever passed to logging calls
+(`logging.info("...")`, `self.log.debug(...)`, and similar), literals stored
+directly into dunder names (module and class docstrings via `__doc__`, class
+machinery such as `__qualname__`, metadata like `__version__`), and the
+parameter-name strings used to build function annotations (`data`, `return`,
+...). Unused constants such as function docstrings are never loaded and are
+skipped naturally. Because the dictionary is written as a plain text file, it
+can still be reviewed and trimmed before use.
 
 ```python
 import atheris

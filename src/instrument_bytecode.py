@@ -78,11 +78,18 @@ debug_instrument_only_blocks: List[int] | None = None
 #
 # Collection is opt-in because, as noted in
 # https://github.com/google/atheris/issues/48, indiscriminately harvesting
-# every literal can pull in noise. To keep the dictionary useful, literals that
-# are only passed to logging calls (`logging.info("...")`, `self.log.debug(...)`
-# and similar) are ignored -- these are almost never interesting comparison
-# targets. The resulting dictionary file is plain text, so it can still be
-# reviewed and trimmed before use.
+# every literal can pull in noise. To keep the dictionary useful, several
+# classes of literals that are almost never interesting comparison targets are
+# ignored:
+#   - literals only passed to logging calls (`logging.info("...")`,
+#     `self.log.debug(...)` and similar),
+#   - literals stored directly into dunder names (module/class docstrings via
+#     `__doc__`, class machinery such as `__qualname__` and
+#     `__static_attributes__`, metadata like `__version__`),
+#   - annotation names and values pushed while building a function's
+#     `__annotations__` (parameter names such as `data`/`return`).
+# The resulting dictionary file is plain text, so it can still be reviewed and
+# trimmed before use.
 # ---------------------------------------------------------------------------
 
 # Whether string/bytes literals should be aggregated during instrumentation.
@@ -213,18 +220,186 @@ def _find_logging_literal_positions(
   return ignore
 
 
+def _find_dunder_store_positions(
+    instructions: List[dis.Instruction],
+) -> Set[int]:
+  """Returns indices of LOAD_CONST instructions stored directly into dunders.
+
+  Module and class docstrings are ordinary constants loaded via LOAD_CONST and
+  stored into `__doc__`, and the class machinery similarly stores constants
+  into names like `__qualname__` and `__static_attributes__`. None of these
+  (nor metadata assignments like `__version__ = "1.2.3"`) are useful fuzzing
+  tokens, so a constant whose only next use is a store to a dunder name is
+  ignored.
+  """
+  ignore: Set[int] = set()
+  for i in range(1, len(instructions)):
+    instr = instructions[i]
+    if instr.opname not in ("STORE_NAME", "STORE_GLOBAL"):
+      continue
+    name = instr.argval
+    if not (
+        isinstance(name, str) and name.startswith("__") and name.endswith("__")
+    ):
+      continue
+    if instructions[i - 1].opname == "LOAD_CONST":
+      ignore.add(i - 1)
+  return ignore
+
+
+def _find_build_class_name_positions(
+    instructions: List[dis.Instruction],
+) -> Set[int]:
+  """Returns indices of LOAD_CONST class-name arguments to `__build_class__`.
+
+  A class statement compiles to `LOAD_BUILD_CLASS`, the class body function,
+  and the class name as a plain string constant. The name is only ignored when
+  it matches the co_name of the code object made into a function right before
+  it, so unrelated string arguments following a function creation are kept.
+  """
+  ignore: Set[int] = set()
+  for i, instr in enumerate(instructions):
+    if instr.opname != "MAKE_FUNCTION" or i == 0:
+      continue
+    code_instr = instructions[i - 1]
+    if code_instr.opname != "LOAD_CONST" or not isinstance(
+        code_instr.argval, types.CodeType
+    ):
+      continue
+    j = i + 1
+    while (
+        j < len(instructions)
+        and instructions[j].opname == "SET_FUNCTION_ATTRIBUTE"
+    ):
+      j += 1
+    if j >= len(instructions):
+      continue
+    name_instr = instructions[j]
+    if (
+        name_instr.opname == "LOAD_CONST"
+        and isinstance(name_instr.argval, str)
+        and name_instr.argval == code_instr.argval.co_name
+    ):
+      ignore.add(j)
+  return ignore
+
+
+def _stack_item_window_start(
+    instructions: List[dis.Instruction], end: int
+) -> "int | None":
+  """Returns the start of the instruction window producing one stack item.
+
+  Walks backwards from `end` (inclusive) accumulating stack effects until the
+  instructions seen so far push exactly one net item. Returns None when the
+  window cannot be determined locally (control flow, unknown stack effects).
+  """
+  need = 1
+  i = end
+  while i >= 0:
+    instr = instructions[i]
+    if "JUMP" in instr.opname or instr.opname in ("FOR_ITER", "SEND"):
+      return None
+    try:
+      need -= dis.stack_effect(instr.opcode, instr.arg)
+    except ValueError:
+      return None
+    if need <= 0:
+      return i if need == 0 else None
+    if getattr(instr, "is_jump_target", False):
+      return None
+    i -= 1
+  return None
+
+
+def _find_annotation_literal_positions(
+    instructions: List[dis.Instruction],
+) -> Set[int]:
+  """Returns indices of LOAD_CONST instructions that feed `__annotations__`.
+
+  Parameter names ('data', 'return', ...) and quoted annotation values are
+  pushed as string constants while building the annotations tuple attached to
+  a function object -- via MAKE_FUNCTION with the 0x04 flag on Python <= 3.12,
+  or SET_FUNCTION_ATTRIBUTE 4 on Python 3.13+. With
+  `from __future__ import annotations` the whole tuple is a single constant.
+  Neither form yields useful fuzzing tokens.
+  """
+  ignore: Set[int] = set()
+  for i, instr in enumerate(instructions):
+    # Locate the LOAD_CONST pushing the function's code object, and count the
+    # stack items (e.g. the closure tuple) pushed between the annotations
+    # tuple and that code object.
+    if instr.opname == "MAKE_FUNCTION" and instr.arg and instr.arg & 0x04:
+      code_idx = i - 1
+      skip_items = 1 if instr.arg & 0x08 else 0
+    elif instr.opname == "SET_FUNCTION_ATTRIBUTE" and instr.arg == 0x04:
+      # Values are consumed in reverse push order, so each earlier
+      # SET_FUNCTION_ATTRIBUTE consumed one item pushed after the annotations.
+      j = i - 1
+      skip_items = 0
+      while j >= 0 and instructions[j].opname == "SET_FUNCTION_ATTRIBUTE":
+        skip_items += 1
+        j -= 1
+      if j < 0 or instructions[j].opname != "MAKE_FUNCTION":
+        continue
+      code_idx = j - 1
+    else:
+      continue
+
+    if code_idx < 0:
+      continue
+    code_instr = instructions[code_idx]
+    if code_instr.opname != "LOAD_CONST" or not isinstance(
+        code_instr.argval, types.CodeType
+    ):
+      continue
+
+    end = code_idx - 1
+    for _ in range(skip_items):
+      start = _stack_item_window_start(instructions, end)
+      if start is None:
+        break
+      end = start - 1
+    else:
+      if end < 0:
+        continue
+      start = _stack_item_window_start(instructions, end)
+      if start is None:
+        continue
+      for j in range(start, end + 1):
+        cand = instructions[j]
+        if cand.opname == "LOAD_CONST" and isinstance(
+            cand.argval, (str, bytes, tuple)
+        ):
+          ignore.add(j)
+  return ignore
+
+
 def _collect_code_literals(code: types.CodeType) -> None:
-  """Collects str/bytes literals loaded by a code object, excluding logging.
+  """Collects str/bytes literals loaded by a code object, excluding noise.
 
   Only constants that are actually loaded (via LOAD_CONST) are considered, so
-  unused constants such as docstrings are naturally skipped. Constants passed
-  exclusively to logging calls are ignored.
+  unused constants such as function docstrings are naturally skipped.
+  Constants passed exclusively to logging calls, stored into dunder names
+  (module/class docstrings, `__version__`, ...), or used to build function
+  annotations are ignored.
   """
+  if code.co_name == "__annotate__":
+    # Python 3.14+ (PEP 649) compiles annotations into a separate
+    # `__annotate__` code object; nothing in it is a useful fuzzing token.
+    return
+
   instructions = list(dis.get_instructions(code))
-  logging_positions = _find_logging_literal_positions(instructions)
+  ignored_positions = _find_logging_literal_positions(instructions)
+  ignored_positions |= _find_dunder_store_positions(instructions)
+  ignored_positions |= _find_annotation_literal_positions(instructions)
+  ignored_positions |= _find_build_class_name_positions(instructions)
 
   for i, instr in enumerate(instructions):
-    if instr.opname != "LOAD_CONST" or i in logging_positions:
+    # RETURN_CONST (Python 3.12/3.13) returns a constant without a separate
+    # LOAD_CONST, e.g. `return "literal"`.
+    if instr.opname not in ("LOAD_CONST", "RETURN_CONST"):
+      continue
+    if i in ignored_positions:
       continue
     const = instr.argval
     if isinstance(const, (str, bytes)):
